@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>World map, Treemap, Polar small multiples</title>
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="https://unpkg.com/topojson-client@3"></script>
+<style>
+  body { font-family: "Helvetica Neue", Arial, sans-serif; background:#fafafa; margin:16px; }
+  h2 { margin: 8px 0 6px; font-weight:700; color:#222; }
+  .viz { background: white; border: 1px solid #e6e6e6; padding: 8px; margin-bottom: 16px; box-shadow: 0 2px 6px rgba(0,0,0,0.04);}
+  .controls { margin: 8px 0 12px; }
+  .controls label { margin-right: 12px; cursor:pointer; user-select:none; }
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: #fff;
+    border: 1px solid #444;
+    padding: 8px;
+    border-radius: 6px;
+    font-size: 13px;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.12);
+    white-space: pre-line;
+    opacity: 0;
+    transition: opacity 120ms;
+  }
+  .dimmed { opacity: 0.2 !important; }
+  .selected { stroke:#000 !important; stroke-width:1.6 !important; }
+
+  .polar-grid { display:flex; flex-wrap:wrap; gap:20px; }
+  .polar-cell { width:150px; height:150px; position:relative; border-radius:6px; background:#fff; display:flex; justify-content:center; align-items:center; cursor:pointer; }
+  .polar-label { position:absolute; top:4px; left:0; right:0; text-align:center; font-weight:600; font-size:12px; }
+  .muted-message { color:#888; font-style:italic; margin:8px 0; }
+</style>
+</head>
+<body>
+
+<div class="viz" id="mapViz">
+  <h2>World map with K-pop counts</h2>
+  <div id="map"></div>
+</div>
+
+<div class="viz" id="filters">
+  <strong>Show fandoms:</strong>
+  <div class="controls" id="fandomControls"></div>
+</div>
+
+<div class="viz" id="treemapViz">
+  <h2>Treemap showing engagement_type</h2>
+  <h3 id="selectedTreemapLabel" style="margin:4px 0; color:#555;"></h3>
+  <div id="treemap"></div>
+  <div id="treemapMessage" class="muted-message"></div>
+</div>
+
+<div class="viz" id="polarViz">
+  <h2>Polar small multiples showing fans distribution in each country</h2>
+  <h3 id="selectedPolarLabel" style="margin:4px 0; color:#555;"></h3>
+  <div id="polar"></div>
+  <div id="polarMessage" class="muted-message"></div>
+</div>
+
+<div id="tooltip" class="tooltip"></div>
+
+<script>
+(async () => {
+  const tooltip = d3.select("#tooltip");
+  let selectedCountry = null;
+
+  const ALL_FANDOMS = ["BTS","ZB1","Blackpink","Enhypen"];
+
+  const fandomToPrefixes = {
+    "BTS": ["BTS"],
+    "ZB1": ["ZB1"],
+    "Blackpink": ["Blackpink"],
+    "Enhypen": ["Enhypen"]
+  };
+
+  let activeFandoms = new Set(ALL_FANDOMS); 
+
+  const treemapLabel = d3.select("#selectedTreemapLabel");
+  const polarLabel   = d3.select("#selectedPolarLabel");
+  const treemapMessage = d3.select("#treemapMessage");
+  const polarMessage = d3.select("#polarMessage");
+
+  function getFanValueForFandom(row, fandom) {
+    const prefixes = fandomToPrefixes[fandom] || [fandom];
+    for (const p of prefixes) {
+      const keys = [
+        `${p}-fans`,
+        `${p} fans`,
+        `${p}_fans`,
+        `${p}`
+      ];
+      for (const k of keys) {
+        if (k in row && row[k] !== undefined && row[k] !== null) {
+          const n = Number(String(row[k]).trim());
+          if (!Number.isNaN(n)) return n;
+        }
+      }
+    }
+    return 0;
+  }
+
+  function buildFoldColumns() {
+    const engagementTypes = ["mv","livestreams","shorts","dance-practice","fancam"];
+    const cols = [];
+    for (const fandom of ALL_FANDOMS) {
+      const prefixes = fandomToPrefixes[fandom];
+      for (const p of prefixes) {
+        for (const et of engagementTypes) cols.push(`${p}-${et}`);
+      }
+    }
+    return cols;
+  }
+  const topoUrl = "https://raw.githubusercontent.com/vega/vega-datasets/master/data/world-110m.json";
+  const csvUrl  = "https://raw.githubusercontent.com/Leema-sh/map/main/Kpop-dataset.csv";
+
+  const kpopData = [
+    {"id":12,"country":"Algeria","kpop":450000},
+    {"id":180,"country":"Democratic Republic of the Congo","kpop":550000},
+    {"id":729,"country":"Sudan","kpop":250000},
+    {"id":124,"country":"Canada","kpop":4800000},
+    {"id":840,"country":"United States","kpop":34000000},
+    {"id":484,"country":"Mexico","kpop":10000000},
+    {"id":643,"country":"Russia","kpop":15000000},
+    {"id":156,"country":"China","kpop":110000000},
+    {"id":356,"country":"India","kpop":70000000},
+    {"id":76,"country":"Brazil","kpop":24000000},
+    {"id":32,"country":"Argentina","kpop":4500000},
+    {"id":604,"country":"Peru","kpop":3400000},
+    {"id":804,"country":"Ukraine","kpop":2500000},
+    {"id":250,"country":"France","kpop":6500000},
+    {"id":36,"country":"Australia","kpop":2700000},
+    {"id":598,"country":"Papua New Guinea","kpop":100000},
+    {"id":554,"country":"New Zealand","kpop":420000}
+  ];
+
+  const [topoJson, csvRowsRaw] = await Promise.all([
+    d3.json(topoUrl),
+    d3.csv(csvUrl)
+  ]);
+
+  const csvRows = csvRowsRaw
+    .filter(r => Object.values(r).some(v => v !== null && String(v).trim() !== "")) 
+    .map(r => {
+      const country = (r.Country || r.country || r.country_name || "").trim();
+      return Object.assign({}, r, { Country: country });
+    })
+    .filter(r => r.Country && r.Country.length > 0); 
+
+  function cleanNumber(v){
+    if (v===null || v===undefined) return 0;
+    const s = String(v).trim();
+    if (s==="" || s==="-" || s.toLowerCase()==="n/a") return 0;
+    const n = Number(s);
+    return Number.isFinite(n)? n:0;
+  }
+
+  
+  let mapPaths;
+  (function drawMap(){
+    const width=960, height=400;
+    const svg = d3.select("#map").append("svg").attr("width",width).attr("height",height);
+    const projection = d3.geoEquirectangular().scale(150).translate([width/2, height/2.6]);
+    const path = d3.geoPath().projection(projection);
+
+    const countries = topojson.feature(topoJson, topoJson.objects.countries).features;
+    const kmap = new Map(kpopData.map(d=>[d.id,d]));
+    const worldJoined = countries.map(f=>Object.assign({}, f, kmap.get(f.id)));
+
+    const colorScale = d3.scaleSequential().domain(d3.extent(kpopData,d=>d.kpop)).interpolator(d3.interpolateOranges);
+
+    mapPaths = svg.append("g").selectAll("path")
+        .data(worldJoined)
+        .join("path")
+        .attr("class","country-shape")
+        .attr("d",path)
+        .attr("fill", d => d.kpop != null ? colorScale(d.kpop) : "#e6e6e6")
+        .attr("stroke","#333")
+        .attr("stroke-width",0.3)
+        .on("mousemove",(event,d)=>{
+            const txt=d.country?`Country: ${d.country}\nK-pop Fans: ${d.kpop?.toLocaleString()}`:"";
+            tooltip.style("opacity",1).style("left",(event.pageX+12)+"px").style("top",(event.pageY+12)+"px").html(txt);
+        })
+        .on("mouseout",()=>tooltip.style("opacity",0))
+        .on("click",(event,d)=>{ if(d.country) updateSelection(d.country); });
+  })();
+
+  function updateMapHighlight(){
+    if (!mapPaths) return;
+    mapPaths.classed("dimmed", d => selectedCountry && d.country !== selectedCountry)
+            .classed("selected", d => selectedCountry && d.country === selectedCountry);
+  }
+
+  function buildFilterUI(){
+    const container = d3.select("#fandomControls");
+    container.selectAll("*").remove();
+    ALL_FANDOMS.forEach(f => {
+      const id = `chk-${f}`;
+      const wrapper = container.append("label");
+      wrapper.append("input")
+        .attr("type","checkbox")
+        .attr("id", id)
+        .attr("checked", true)
+        .on("change", function() {
+          const checked = this.checked;
+          if (checked) activeFandoms.add(f); else activeFandoms.delete(f);
+          renderTreemap();
+          renderPolar();
+        });
+      wrapper.append("span").text(` ${f} `);
+    });
+    container.append("button").text("Select All").style("margin-left","12px").on("click", ()=>{
+      activeFandoms = new Set(ALL_FANDOMS);
+      container.selectAll("input").property("checked", true);
+      renderTreemap(); renderPolar();
+    });
+    container.append("button").text("Clear All").style("margin-left","6px").on("click", ()=>{
+      activeFandoms = new Set();
+      container.selectAll("input").property("checked", false);
+      renderTreemap(); renderPolar();
+    });
+  }
+  buildFilterUI();
+
+  function renderTreemap(){
+    const container = d3.select("#treemap");
+    container.selectAll("*").remove();
+    treemapMessage.text("");
+
+    const selected = Array.from(activeFandoms);
+    if (selected.length === 0) {
+      treemapMessage.text("No fandom selected — enable at least one fandom to see treemap.");
+      return;
+    }
+
+    const foldColumns = buildFoldColumns();
+
+    const fandomsForRoot = selected.slice(); 
+    const rootObj = { id:"root", children: fandomsForRoot.map(f => ({ id: f, children: [] })) };
+
+    csvRows.forEach(row => {
+      const country = row.Country || row.country || "Unknown";
+      selected.forEach(fandom => {
+        const prefixes = fandomToPrefixes[fandom];
+        prefixes.forEach(pref => {
+          ["mv","livestreams","shorts","dance-practice","fancam"].forEach(type => {
+            const col = `${pref}-${type}`;
+            if (!(col in row)) return;
+            const val = cleanNumber(row[col]);
+            if (val <= 0) return;
+            const parent = rootObj.children.find(x => x.id === fandom);
+            if (!parent) return;
+            parent.children.push({
+              country_name: country,
+              fandom: fandom,
+              engagement_type: type,
+              engagement_value: val
+            });
+          });
+        });
+      });
+    });
+
+    rootObj.children.forEach(c => c.children = c.children.filter(l => l.engagement_value > 0));
+    rootObj.children = rootObj.children.filter(c => c.children.length > 0);
+
+    if (rootObj.children.length === 0) {
+      treemapMessage.text("No engagement data available for selected fandom(s).");
+      return;
+    }
+
+    const width=960, height=420;
+    const svg = container.append("svg").attr("width",width).attr("height",height);
+
+    const hierarchy = d3.hierarchy(rootObj).sum(d=>d.engagement_value||0).sort((a,b)=>b.value-a.value);
+    d3.treemap().size([width,height]).padding(2).round(true)(hierarchy);
+
+    const fandomHue = d3.scaleOrdinal().domain(ALL_FANDOMS).range([270,210,330,0]);
+    const leafVals = hierarchy.leaves().map(d=>d.data.engagement_value || 0);
+    const engagementLight = d3.scaleLinear().domain(d3.extent(leafVals)).range([90,40]);
+
+    const g = svg.append("g");
+
+    const parents = g.selectAll("rect.parent").data(hierarchy.children).join("rect")
+      .attr("class","parent")
+      .attr("x",d=>d.x0).attr("y",d=>d.y0)
+      .attr("width",d=>d.x1-d.x0).attr("height",d=>d.y1-d.y0)
+      .attr("fill", d => { const hue=fandomHue(d.data.id); return `hsl(${hue},30%,80%)`; });
+
+    const leaves = g.selectAll("rect.leaf").data(hierarchy.leaves()).join("rect")
+      .attr("class","leaf")
+      .attr("x",d=>d.x0).attr("y",d=>d.y0)
+      .attr("width",d=>d.x1-d.x0).attr("height",d=>d.y1-d.y0)
+      .attr("fill", d => { const hue=fandomHue(d.data.fandom); const light=engagementLight(d.data.engagement_value||0); return `hsl(${hue},70%,${light}%)`; })
+      .on("click",(event,d)=> updateSelection(d.data.country_name))
+      .on("mousemove",(event,d)=>{
+        tooltip.style("opacity",1).style("left",(event.pageX+12)+"px").style("top",(event.pageY+12)+"px")
+               .html(`Country: ${d.data.country_name}\nFandom: ${d.data.fandom}\nEngagement: ${d.data.engagement_type}\nValue: ${d.data.engagement_value}`);
+      })
+      .on("mouseout",()=> tooltip.style("opacity",0));
+
+    const labels = g.selectAll("text.fandom").data(hierarchy.children).join("text")
+      .attr("class","fandom")
+      .attr("x",d=>(d.x0+d.x1)/2).attr("y",d=>(d.y0+d.y1)/2)
+      .attr("text-anchor","middle")
+      .attr("dominant-baseline","middle")
+      .style("font-weight","bold")
+      .text(d=>d.data.id);
+
+    treemapLeaves = leaves;
+    treemapParents = parents;
+    treemapLabels = labels;
+
+    updateTreemapHighlight();
+  }
+
+  renderTreemap();
+
+  function updateTreemapHighlight(){
+    if (!treemapLeaves) return;
+    treemapLeaves.classed("dimmed", d => selectedCountry && d.data.country_name !== selectedCountry);
+    treemapParents.classed("dimmed", selectedCountry !== null);
+    treemapLabels.classed("dimmed", selectedCountry !== null);
+  }
+
+  
+  function renderPolar(){
+    const container = d3.select("#polar");
+    container.selectAll("*").remove();
+    polarMessage.text("");
+
+    const selected = Array.from(activeFandoms);
+    if (selected.length === 0) {
+      polarMessage.text("No fandom selected — enable at least one fandom to see polar charts.");
+      return;
+    }
+
+    
+    const fandomOrderCanonical = ["BTS","ZB1","Blackpink","Enhypen"];
+    
+    const fandomOrderToDraw = [];
+    fandomOrderCanonical.forEach(f => {
+      if (!activeFandoms.has(f)) return;
+      const prefixes = fandomToPrefixes[f];
+      const exists = csvRows.some(row => prefixes.some(p => (`${p}-fans` in row) || (`${p} fans` in row) || (`${p}_fans` in row) || (p in row)));
+      if (exists) fandomOrderToDraw.push(f);
+    });
+
+    if (fandomOrderToDraw.length === 0) {
+      polarMessage.text("Selected fandom(s) have no fan columns in the dataset.");
+      return;
+    }
+
+    
+    const countries = csvRows.map(row => {
+      const countryName = row.Country || row.country || "Unknown";
+      const fans = {};
+      fandomOrderToDraw.forEach(f => fans[`${f}-fans`] = getFanValueForFandom(row, f));
+      return { country: countryName, fans };
+    }).filter(d => Object.values(d.fans).some(v => v > 0)); 
+
+    if (countries.length === 0) {
+      polarMessage.text("No fan counts > 0 for selected fandom(s).");
+      return;
+    }
+
+    const allFans = countries.flatMap(c => Object.values(c.fans));
+    const radiusScale = d3.scaleSqrt().domain(d3.extent(allFans)).range([0,50]);
+
+    const containerDiv = container.append("div").attr("class","polar-grid");
+
+    polarCells = containerDiv.selectAll("div.polar-cell").data(countries).join("div")
+      .attr("class","polar-cell")
+      .on("click",(e,d)=> updateSelection(d.country));
+
+    polarCells.append("div").attr("class","polar-label").text(d=>d.country);
+
+    const hueMap = { "BTS":270, "ZB1":210, "Blackpink":330, "Enhypen":0 };
+
+    polarCells.each(function(d) {
+      const svg = d3.select(this).append("svg").attr("width",150).attr("height",150);
+      const g = svg.append("g").attr("transform","translate(75,75)");
+
+      const n = fandomOrderToDraw.length;
+      fandomOrderToDraw.forEach((f, i) => {
+        const start = 2*Math.PI*(i/n);
+        const end = start + 2*Math.PI*(1/n);
+        const key = `${f}-fans`;
+        const r = radiusScale(d.fans[key] || 0);
+        const arc = d3.arc().innerRadius(0).outerRadius(r).startAngle(start).endAngle(end);
+
+        g.append("path")
+          .attr("d", arc())
+          .attr("fill", ()=>{
+            const hue = hueMap[f] ?? 200;
+            const light = (r===0)? 95 : (90 - ((r/50)*50));
+            return `hsl(${hue},70%,${Math.max(30, Math.min(90, Math.round(light))) }%)`;
+          })
+          .on("mousemove", (event) => {
+            tooltip.style("opacity",1).style("left",(event.pageX+12)+"px").style("top",(event.pageY+12)+"px")
+                   .html(`Country: ${d.country}\nFandom: ${f}\nFans: ${d.fans[key] || 0}`);
+          })
+          .on("mouseout", ()=> tooltip.style("opacity",0))
+          .on("mouseover", function(){ d3.select(this).attr("opacity",0.85); })
+          .on("mouseleave", function(){ d3.select(this).attr("opacity",1); });
+      });
+    });
+
+    updatePolarHighlight();
+  }
+  renderPolar();
+
+  function updatePolarHighlight(){
+    if (!polarCells) return;
+    polarCells.classed("dimmed", d => selectedCountry && d.country !== selectedCountry);
+  }
+
+
+  function updateLabels() {
+    if (selectedCountry) {
+      treemapLabel.text(`Selected country: ${selectedCountry}`);
+      polarLabel.text(`Selected country: ${selectedCountry}`);
+    } else {
+      treemapLabel.text("");
+      polarLabel.text("");
+    }
+  }
+
+  function updateSelection(countryName) {
+    selectedCountry = (selectedCountry === countryName ? null : countryName);
+    updateMapHighlight();
+    updateTreemapHighlight();
+    updatePolarHighlight();
+    updateLabels();
+  }
+
+  window._renderTreemap = renderTreemap;
+  window._renderPolar = renderPolar;
+
+})();
+</script>
+</body>
+</html>
